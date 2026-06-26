@@ -1,0 +1,319 @@
+================================================================================
+ SHA-1 HARDWARE ACCELERATOR  -  README
+ Target: Lattice iCE40UP5K (iCESugar v1.5)   |   Verified on Icarus + Yosys
+================================================================================
+
+PURPOSE
+-------
+This is a SHA-1 (160-bit) hash core, derived from an existing SHA3-256 design by
+swapping the algorithm while keeping the same front-end interface. It exists as a
+deliberately SIMPLE core so that the first hardware bring-up of the AXI + RISC-V
+SoC happens with all the difficulty in DEPLOYMENT, not in the hash itself.
+
+  *** SHA-1 IS CRYPTOGRAPHICALLY BROKEN (public collisions since 2017). ***
+  *** Use it ONLY as a hardware-learning / bring-up vehicle, never as a   ***
+  *** "secure" accelerator. The real target remains SHA-3.                ***
+
+All resource numbers below are REAL synthesis results from:
+    Yosys 0.33   synth_ice40   (SB_LUT4 / SB_DFF / SB_CARRY counts)
+They are NOT hand estimates. Final placed numbers come from nextpnr-ice40.
+
+
+--------------------------------------------------------------------------------
+ 1. FILE MANIFEST
+--------------------------------------------------------------------------------
+  input_register.v   Block 1. 64-bit input register. UNCHANGED from SHA-3
+                     (algorithm-agnostic). Reused verbatim.
+
+  sha1_padder.v      Block 2. SHA-1 padding: 512-bit blocks, 0x80 pad byte,
+                     64-bit big-endian length. Replaces the SHA-3 padder.
+
+  sha1_core.v        Blocks 3+4. The whole compression: 16-word message
+                     schedule + 80 rounds. Replaces SEVEN SHA-3 files
+                     (state_formation, keccak_f, keccak_round, theta, rho,
+                     pi, chi, iota) because SHA-1 has no permutation steps.
+                     [Readable version: indexed circular-buffer schedule.]
+
+  sha1_core_opt.v    Drop-in replacement for sha1_core with a SHIFT-REGISTER
+                     schedule. Identical behaviour, ~49% fewer LUTs in the
+                     core. Recommended once you need room for PicoRV32.
+
+  sha1_top.v         Top level. Wires input_register -> sha1_padder ->
+                     sha1_core. (Uses the readable core.)
+
+  sha1_top_opt.v     Same top, instantiates sha1_core_opt instead.
+
+  tb_sha1_top.v      End-to-end testbench. 3 NIST/standard vectors.
+
+  tb_padder.v        Padder-only testbench. Checks the 2-block padding
+                     (length-spill) path against known-good blocks.
+
+
+--------------------------------------------------------------------------------
+ 2. DATA FLOW
+--------------------------------------------------------------------------------
+
+  msg_in[63:0]      +----------------+   word    +-------------+
+  valid_in   -----> | input_register | --------> | sha1_padder |
+  is_last    -----> |  (Block 1)     |  +flags   |  (Block 2)  |
+  byte_count -----> +----------------+           +-------------+
+                                                    |  block_out[511:0]
+                                                    |  padd_done
+                                                    |  is_last_block
+                                                    v
+                              +-------------------------------------+
+                              |            sha1_core                |
+                              |  (Blocks 3+4)                       |
+                              |  16-word schedule W  +  80 rounds   |
+                              +-------------------------------------+
+                                                    |  hash_out[159:0]
+                                                    |  done
+                                                    v
+                                           hash_out / hash_valid
+
+  Word feeding (64-bit, BIG-ENDIAN: first byte = MSB):
+    - non-last words: valid_in=1, is_last=0, byte_count=8
+    - last word     : valid_in=1, is_last=1, byte_count = valid bytes (0-8)
+
+
+--------------------------------------------------------------------------------
+ 3. WHAT EACH MODULE DOES
+--------------------------------------------------------------------------------
+
+3.1  input_register.v  (Block 1)
+---------------------------------
+  Registers one 64-bit word and forwards the side-band flags (is_last,
+  byte_count) one cycle later. Pure plumbing; identical to the SHA-3 build.
+  This is why the front-end and the future AXI wrapper do not change when
+  the hash algorithm changes.
+
+  Ports:
+    in : clk, rst_n, msg_in[63:0], valid_in, is_last, byte_count[3:0]
+    out: msg_out[63:0], valid_out, last_out, byte_count_out[3:0]
+
+
+3.2  sha1_padder.v  (Block 2)
+-----------------------------
+  Accumulates incoming 64-bit words into a 512-bit block and applies SHA-1
+  padding. SHA-1 padding differs from SHA-3 in three ways:
+
+    1. Block size 512 bits = 8 x 64-bit words (SHA-3 rate was 1088 / 17 lanes).
+    2. Pad byte is 0x80 (a '1' bit then zeros), NOT 0x06. No domain byte.
+    3. The 64-bit BIG-ENDIAN message bit-length is appended in the final
+       8 bytes of the last block.
+
+  Because SHA-1 is big-endian throughout, there is NO byte-swap (the SHA-3
+  build_lane little-endian flip is gone). The first byte received is the MSB
+  of M[0]. The 64-bit length lands cleanly in the 8th word (wblk[7]):
+       block_out[63:32] = M[14] = length[63:32]
+       block_out[31:0]  = M[15] = length[31:0]
+
+  Output packing (big-endian, M[0] in the MSBs):
+       block_out[511:480] = M[0]   ...   block_out[31:0] = M[15]
+
+  Internals of note:
+    - build_last(): places 0x80 immediately after the valid bytes of the
+      final partial word (case on byte_count).
+    - Registered output (block_out) -> avoids the stale-combinational read
+      bug the SHA-3 padder had documented.
+    - Two-block path (state EMIT2): when data + 0x80 leave no room for the
+      length, a SECOND block (zeros + length, plus a leading 0x80 if needed)
+      is emitted. Fully implemented and VERIFIED (see tb_padder.v), covers
+      the 55/56/64-byte boundary cases.
+
+  Ports:
+    in : clk, rst_n, msg_in[63:0], valid_in, is_last, byte_count[3:0]
+    out: block_out[511:0], padd_done (1-cycle), is_last_block
+
+
+3.3  sha1_core.v  (Blocks 3+4)  -- the heart
+--------------------------------------------
+  SHA-1 has no theta/rho/pi/chi/iota. One module does everything:
+
+  (a) Message schedule W (16 x 32-bit), computed on the fly:
+        W[t] = M[t]                                    for t < 16
+        W[t] = ROTL1(W[t-3]^W[t-8]^W[t-14]^W[t-16])    for t >= 16
+      Stored as a 16-word window (512 FF), not all 80 words (2560 FF).
+      [Readable core: indexed circular buffer -> dynamic 16:1 read muxes.
+       Optimized core: shift register with fixed taps -> muxes vanish.]
+
+  (b) 80 rounds, one per clock:
+        T = ROTL5(a) + f(t,b,c,d) + e + K(t) + W[t]   (all + are mod 2^32)
+        e=d; d=c; c=ROTL30(b); b=a; a=T
+      f and K change every 20 rounds (FIPS 180-4):
+        t  0..19 : f = (b&c)|(~b&d)            K = 0x5A827999
+        t 20..39 : f = b^c^d                   K = 0x6ED9EBA1
+        t 40..59 : f = (b&c)|(b&d)|(c&d)       K = 0x8F1BBCDC
+        t 60..79 : f = b^c^d                   K = 0xCA62C1D6
+
+  (c) FSM: IDLE -> RUN (80 cycles) -> FIN.
+      On start: if first_block, load H = init constants; else continue from
+      stored H. After 80 rounds, H += {a,b,c,d,e}. If last_block, emit digest.
+
+  Multi-block hooks:
+    first_block = 1  -> initialise H to the SHA-1 constants
+    first_block = 0  -> continue chaining from current H
+    last_block       -> latched; drives done / hash_out
+
+  Latency: ~82 clocks per block (1 load + 80 rounds + 1 finalise).
+
+  Digest (big-endian, H0 first):
+    hash_out[159:128]=H0  [127:96]=H1  [95:64]=H2  [63:32]=H3  [31:0]=H4
+
+  Ports:
+    in : clk, rst_n, block_in[511:0], start, first_block, last_block
+    out: hash_out[159:0], done (1-cycle)
+
+
+3.4  sha1_top.v / sha1_top_opt.v
+--------------------------------
+  Connects the three blocks. On padd_done it pulses the core's start, drives
+  first_block (from an internal msg_first tracker) and last_block (from the
+  padder's is_last_block), and latches hash_out/hash_valid when the core
+  finishes. NOTE: SHA-1 needs NO output byte-swap (the SHA-3 top reversed each
+  lane for little-endian Keccak; here the digest is emitted directly).
+
+  sha1_top      uses sha1_core      (readable, larger).
+  sha1_top_opt  uses sha1_core_opt  (shift-register schedule, smaller).
+
+
+--------------------------------------------------------------------------------
+ 4. RESOURCE USAGE  (REAL, Yosys 0.33 synth_ice40)
+--------------------------------------------------------------------------------
+  Device iCE40UP5K budget: 5280 logic cells (each = 1 LUT4 + 1 DFF),
+  120 kbit EBR, 1 Mbit SPRAM. (1 carry cell also lives in a logic cell.)
+
+  PER MODULE
+  -------------------------------------------------------------------
+   Module              LUT4    FF      CARRY   notes
+  -------------------------------------------------------------------
+   input_register         6      70        0   trivial plumbing
+   sha1_padder         1402    1086      114   wide block assembly +
+                                               wblk + block_out + len adder
+   sha1_core (readable) 2880   1004      217   schedule index-muxes dominate
+   sha1_core_opt        1482   1004      208   shift-reg schedule (taps fixed)
+  -------------------------------------------------------------------
+
+  FULL PIPELINE (no CPU)
+  -------------------------------------------------------------------
+   Top variant         LUT4    % of 5280   FF      % of 5280
+  -------------------------------------------------------------------
+   sha1_top  (readable) 4315       82%      2325       44%
+   sha1_top_opt         2759       52%      2325       44%
+  -------------------------------------------------------------------
+   No EBR/SPRAM is used: the schedule needs 4 reads/cycle, so it stays in
+   fabric. Those 30 EBR + 4 SPRAM blocks are exactly what a future BRAM-backed
+   SHA-3 (Keccak) core would tap.
+
+  WHAT THIS MEANS FOR THE SoC
+  -------------------------------------------------------------------
+   PicoRV32 adds roughly ~2000 LUT4 / ~450 FF, UART ~50 / ~40. So:
+     - readable  pipeline + CPU  ~= 4315 + 2050 = ~6365 LUT  -> OVER 5280, will
+                                                                NOT fit as-is.
+     - optimized pipeline + CPU  ~= 2759 + 2050 = ~4809 LUT  -> ~91%, fits but
+                                                                tight.
+   => For the full SoC, use sha1_top_opt, and consider the padder optimisation
+      below to get comfortable routability margin (<~85%).
+
+  KEY OPTIMISATION LEVERS (measured / expected)
+  -------------------------------------------------------------------
+   A. Shift-register schedule (DONE, sha1_core_opt):
+        core 2880 -> 1482 LUT4  (-49%);  top 4315 -> 2759 LUT4  (-36%).
+        Verified: still passes all 3 vectors.
+   B. Padder double-buffer removal (TODO):
+        sha1_padder holds the block twice (wblk 448 FF + block_out 512 FF) and
+        the core copies it again into the schedule. Streaming the block, or
+        feeding the core directly from wblk, removes ~512 FF and a chunk of the
+        1402 padder LUTs.
+   C. Map the schedule to EBR (advanced):
+        Hard for SHA-1 (4 reads/cycle); more relevant to the future SHA-3
+        BRAM design. Listed for completeness.
+
+
+--------------------------------------------------------------------------------
+ 5. TIMING / LATENCY
+--------------------------------------------------------------------------------
+   Per 512-bit block : ~82 core clocks (1 load + 80 rounds + 1 finalise),
+                       plus a few padder cycles to assemble the block.
+   "abc" (single block) total: well under ~100 clocks.
+   At 12 MHz that is < ~10 microseconds per short message.
+   Fmax: not measured here (comes from nextpnr-ice40). 12 MHz is an easy target;
+   the round adder + schedule feedback is the likely critical path if you push
+   frequency.
+
+
+--------------------------------------------------------------------------------
+ 6. HOW TO SIMULATE  (Icarus Verilog)
+--------------------------------------------------------------------------------
+   # End-to-end, readable core:
+   iverilog -g2012 -o sim_sha1 input_register.v sha1_padder.v \
+            sha1_core.v sha1_top.v tb_sha1_top.v
+   vvp sim_sha1
+
+   # End-to-end, optimized core:
+   iverilog -g2012 -o sim_opt input_register.v sha1_padder.v \
+            sha1_core_opt.v sha1_top_opt.v tb_opt.v
+   vvp sim_opt
+
+   # Padder-only (2-block padding check):
+   iverilog -g2012 -o sim_pad sha1_padder.v tb_padder.v
+   vvp sim_pad
+
+
+--------------------------------------------------------------------------------
+ 7. VERIFICATION STATUS
+--------------------------------------------------------------------------------
+   End-to-end (tb_sha1_top.v), BOTH cores -> 3 PASSED, 0 FAILED:
+     ""     (empty)  da39a3ee5e6b4b0d3255bfef95601890afd80709   PASS
+     "abc"           a9993e364706816aba3e25717850c26c9cd0d89d   PASS
+     pangram         2fd4e1c67a2d28fced849ee1bb76e7391b93eb12   PASS
+
+   Padder 2-block path (tb_padder.v): 56-byte and 64-byte messages produce
+   padded blocks matching the reference byte-for-byte.
+
+   All expected digests were cross-checked against Python hashlib.
+
+
+--------------------------------------------------------------------------------
+ 8. KNOWN LIMITATIONS
+--------------------------------------------------------------------------------
+   * Multi-block STREAMING at the top is not yet sequenced. The padder can emit
+     two blocks correctly, but sha1_top does not hold off the padder while the
+     core is busy (~82 cycles/block). All 3 test vectors are single-block, so
+     they are unaffected. This is the SAME open gap as the SHA-3 top. The
+     first_block/last_block plumbing is already in place for when you add
+     back-pressure (or a small block FIFO).
+   * byte_count overflow on a full last word with 0x80 spill is handled by the
+     padder's 2-block path; just be sure the sender sets is_last + byte_count
+     correctly on the final word.
+   * No reset of the input mid-message except via rst_n; the testbench fully
+     resets between vectors.
+
+
+--------------------------------------------------------------------------------
+ 9. SHA-3 -> SHA-1 FILE MAPPING (for reference)
+--------------------------------------------------------------------------------
+   SHA-3 file(s)                                   SHA-1 file
+   ---------------------------------------------   --------------------------
+   input_register.v                                input_register.v (unchanged)
+   padder.v                                        sha1_padder.v
+   state_formation.v + keccak_f.v + keccak_round.v
+     + theta.v + rho.v + pi.v + chi.v + iota.v     sha1_core.v  (one module)
+   sha3_top.v                                       sha1_top.v
+   testbench.v                                      tb_sha1_top.v
+
+
+--------------------------------------------------------------------------------
+ 10. NEXT STEPS (per the project plan)
+--------------------------------------------------------------------------------
+   Phase 1 (DONE): SHA-1 core verified in simulation.            <- you are here
+   Phase 0       : trivial-core bring-up on the iCESugar to prove the AXI +
+                   PicoRV32 + UART path on silicon.
+   Phase 2       : wrap sha1_core(_opt) in the AXI4-Lite interface.
+   Phase 3       : full SHA-1 SoC on hardware; print SHA-1("abc") over UART.
+   Phase 4       : return to SHA-3 with a BRAM/SPRAM-backed Keccak core
+                   (uses the EBR/SPRAM left idle here).
+
+   For the SoC, prefer sha1_top_opt (smaller) and apply optimisation B
+   (padder) to keep utilisation in the comfortable routability zone.
+================================================================================
