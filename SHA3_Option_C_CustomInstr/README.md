@@ -1,125 +1,476 @@
-# SHA-3 Accelerator — Option C (Custom Instruction) Integration
+# SHA-3 Hardware Accelerator — Option C (Custom Instruction) Integration
 
-The deepest integration: the accelerator is a **coprocessor wired into the
-datapath**, reached by new CUSTOM-0 instructions. No memory map, no addresses —
-operands come straight from the register file and results go straight back on
-the writeback path.
+Wiring an iterative SHA3-256 core into the datapath of a 32-bit, 5-stage RISC-V pipeline as a **coprocessor** reached by new **CUSTOM-0 instructions**. There is no memory map and no bus — operands come straight from the register file and results go straight back on the writeback path.
 
-Verified end-to-end on your actual 5-stage pipeline: a program built from the
-custom instructions computes SHA3-256("abc") correctly.
+Verified in simulation (Icarus Verilog): the full pipeline executes a program built from the custom instructions and produces the correct SHA3-256("abc") digest.
 
-## The custom instruction set
+> **Target digest:**
+> `SHA3-256("abc") = 3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532`
 
-Opcode `CUSTOM-0 = 0b0001011`, R-type field layout, sub-op in `funct3`:
+---
 
-| funct3 | mnemonic | operands | effect | writes rd? |
-|--------|----------|----------|--------|-----------|
-| 000 | SHA.FEED  | rs1=lane_lo, rs2=lane_hi | append a 64-bit lane | no |
-| 001 | SHA.CFG   | rs1=lane_count, rs2=bytecnt | set message params | no |
-| 010 | SHA.START | — | begin hashing | no |
-| 011 | SHA.POLL  | rd | rd <- {31'b0, done} | yes |
-| 100 | SHA.READ  | rd, rs2=index | rd <- digest word[rs2[2:0]] | yes |
+## Table of Contents
 
-A full hash: CFG, then one FEED per lane, then START, then POLL in a loop until
-done, then eight READs for the 256-bit digest. The long hash latency is hidden
-by the POLL loop, so no pipeline stall is required — every custom instruction is
-single-cycle in EX.
+1. [What "custom instruction" means here](#1-what-custom-instruction-means-here)
+2. [Option C vs Options A and B](#2-option-c-vs-options-a-and-b)
+3. [The custom instruction set](#3-the-custom-instruction-set)
+4. [Instruction encoding (CUSTOM-0)](#4-instruction-encoding-custom-0)
+5. [System block diagram](#5-system-block-diagram)
+6. [The four pipeline changes](#6-the-four-pipeline-changes)
+7. [Inside sha3\_cop (the coprocessor)](#7-inside-sha3_cop-the-coprocessor)
+8. [How results reach the register file (and why forwarding just works)](#8-how-results-reach-the-register-file-and-why-forwarding-just-works)
+9. [Byte ordering and the 64-bit-lane / 32-bit-CPU split](#9-byte-ordering-and-the-64-bit-lane--32-bit-cpu-split)
+10. [The completion problem and polling](#10-the-completion-problem-and-polling)
+11. [End-to-end data flow](#11-end-to-end-data-flow)
+12. [File-by-file description](#12-file-by-file-description)
+13. [The demo program (full assembly listing)](#13-the-demo-program-full-assembly-listing)
+14. [How to build and run](#14-how-to-build-and-run)
+15. [Expected output](#15-expected-output)
+16. [Porting to real hardware and the toolchain](#16-porting-to-real-hardware-and-the-toolchain)
+17. [Known limitations](#17-known-limitations)
+18. [Troubleshooting](#18-troubleshooting)
 
-## How it's wired into the pipeline
+---
 
-Four changes, all minimal:
+## 1. What "custom instruction" means here
 
-1. `Control_Unit_cop.v` — decodes `CUSTOM-0`. Takes `funct3` as a new input so
-   it can set `regwrite=1` only for POLL/READ. Emits a new `is_cop` signal.
-2. `IdEx_cop.v` — control bus widened 14 -> 18 bits to carry `is_cop` (bit 17)
-   and `cop_func`=funct3 (bits 16:14) into EX.
-3. `sha3_cop.v` — the coprocessor, instantiated in EX. FEED/CFG/START write its
-   internal state; POLL/READ drive `cop_result` combinationally. A background
-   FSM (IDLE->FEED->HASH->DONE) runs the core after START.
-4. `Main_Module_cop.v` — instantiates the coprocessor and muxes its result onto
-   the ALU writeback path:
-   `ex_result = ex_cop_read ? cop_result : ALU_Result;`
-   Because the result rides the normal ALU path, the existing forwarding unit
-   handles the POLL-then-BEQ dependency in the poll loop with no extra logic.
+Instead of treating the accelerator as memory (Options A/B), Option C makes it part of the CPU's **instruction set**. New opcodes — CUSTOM-0 instructions — carry their operands from general-purpose registers directly into a coprocessor sitting in the EX stage, and the coprocessor's results are written back to a destination register through the normal writeback path.
 
-Nothing else in the pipeline changes — the hazard unit, branch resolution, and
-memory stage are untouched.
+No addresses, no loads/stores to the accelerator, no bus protocol. The accelerator is reached the way `ADD` or `SUB` is: **by executing an instruction.**
 
-## Files
+This is the tightest coupling of the three integration styles and the fastest at the instruction level (no address/bus overhead), but the least portable — the accelerator is now welded to this CPU's ISA and cannot be reused on a different processor without re-implementing the instruction decode. The reference paper lists this ISA-extension route as future work for exactly this reason.
 
-| File | Role |
-|------|------|
-| `sha3_cop.v`          | the datapath coprocessor (core + FSM + custom-op interface) |
-| `Control_Unit_cop.v`  | control unit with CUSTOM-0 decode |
-| `IdEx_cop.v`          | ID/EX register widened to 18-bit control |
-| `Main_Module_cop.v`   | top with coprocessor instantiated + result mux |
-| `assemble_cop.py`     | assembles the demo program |
-| `Instr_Mem_cop.v`     | instruction memory preloaded with the program |
-| `Data_Mem_cop.v`      | data memory seeding constants + READ index values |
-| `tb_cop.v`            | end-to-end testbench (checks abc) |
+---
 
-Unchanged pipeline modules included so the build is self-contained: ALU,
-ALU_Control, Ex_Mem, Forwarding_Unit, Hazard_Detection_Unit, IfId, Imm_Gen,
-MemWb, PC, Reg_File. Plus your SHA-3 sources.
+## 2. Option C vs Options A and B
 
-## Run it (Icarus Verilog)
+|  | A (mem-mapped) | B (AXI4-Lite) | C (custom instr) |
+|---|---|---|---|
+| **CPU interface** | `lw`/`sw` to address | `lw`/`sw` → AXI → bus | New opcodes |
+| **Addresses used** | Yes (MMIO window) | Yes (AXI address) | None |
+| **Decoder change** | Addr decode in MEM | Addr decode + AXI master | New opcode in `Control_Unit` |
+| **Pipeline surgery** | One mux | Stall path | Control bus widened + result mux |
+| **Portability** | Needs a mem bus | Any AXI fabric | Tied to this ISA |
+| **Speed** | Bus-limited | Bus-limited | Tightest |
+
+All three wrap the **same** `sha3_top` core with the **same** register file and the **same** FEED→HASH→DONE background FSM. Only the CPU-facing interface differs.
+
+---
+
+## 3. The Custom Instruction Set
+
+Opcode `CUSTOM-0 = 7'b0001011`. The sub-operation is selected by `funct3`:
+
+| `funct3` | Mnemonic | Operands | Effect | Writes `rd`? |
+|----------|----------|----------|--------|--------------|
+| `000` | `SHA.FEED` | `rs1` = lane_lo, `rs2` = lane_hi | Append a 64-bit lane to the message | No |
+| `001` | `SHA.CFG` | `rs1` = lane_count, `rs2` = byte_count | Set message parameters | No |
+| `010` | `SHA.START` | (none) | Begin hashing | No |
+| `011` | `SHA.POLL` | `rd` | `rd ← {31'b0, done}` | Yes |
+| `100` | `SHA.READ` | `rd`, `rs2` = index | `rd ← digest_word[rs2[2:0]]` | Yes |
+
+**Programming sequence for one hash:**
+
+1. `SHA.CFG` to set `lane_count` and the final lane's `byte_count`
+2. `SHA.FEED` once per lane (lane 0, lane 1, ...)
+3. `SHA.START`
+4. `SHA.POLL` in a loop until the done bit is `1`
+5. `SHA.READ` eight times (indices 0..7) for the 256-bit digest — SHA3-256 uses indices 0..3
+
+> `FEED`/`CFG`/`START` are "write" ops: they update the coprocessor's internal state and do not write a register (`regwrite = 0`). `POLL`/`READ` are "read" ops: they produce a value written to `rd` (`regwrite = 1`).
+
+---
+
+## 4. Instruction Encoding (CUSTOM-0)
+
+R-type field layout is reused:
 
 ```
-iverilog -g2012 -o tb_cop.out tb_cop.v Main_Module_cop.v \
-  Instr_Mem_cop.v Data_Mem_cop.v Control_Unit_cop.v IdEx_cop.v sha3_cop.v \
-  ALU.v ALU_Control.v Ex_Mem.v Forwarding_Unit.v Hazard_Detection_Unit.v \
-  IfId.v Imm_Gen.v MemWb.v PC.v Reg_File.v TOp_module.v input_register.v \
-  padder_unit.v state_formation.v keccak_f.v keccak_round.v theta.v rho.v \
-  pi.v chi.v iota.v
+ 31      25 24   20 19   15 14   12 11    7 6        0
++----------+-------+-------+-------+-------+----------+
+| funct7   |  rs2  |  rs1  | funct3|  rd   |  opcode  |
++----------+-------+-------+-------+-------+----------+
+    7         5       5       3       5        7
+```
+
+- `opcode = 0001011` (CUSTOM-0) for every SHA instruction
+- `funct3` selects the sub-op (see table in [Section 3](#3-the-custom-instruction-set))
+- `funct7` is unused (set to 0)
+
+**Field usage per sub-op:**
+
+| Mnemonic | `rs1` | `rs2` | `rd` |
+|----------|-------|-------|------|
+| `SHA.FEED` | Reg holding lane low 32 bits | Reg holding lane high 32 bits | — |
+| `SHA.CFG` | Reg holding `lane_count` | Reg holding `byte_count` | — |
+| `SHA.START` | Unused (0) | Unused (0) | Unused (0) |
+| `SHA.POLL` | — | — | Destination for done flag |
+| `SHA.READ` | — | Reg whose low 3 bits select digest word (0..7) | Destination for digest word |
+
+> Because this pipeline carries no immediate for R-type, the READ index is taken from a register (`rs2` value), so the demo pre-loads small constants 0..7 into registers to use as indices.
+
+---
+
+## 5. System Block Diagram
+
+```
+IF --> ID --------> EX --------------------> MEM --> WB
+        |            |                                ^
+        | decode     | forwarded rs1 (alu_in1)        |
+        | CUSTOM-0   | forwarded rs2 (alu_in21)       |
+        | sets       |                                |
+        | is_cop,    v                                |
+        | cop_func  +-----------------+   cop_result  |
+        |           |   sha3_cop      |---------+     |
+        |           | (coprocessor)   |         |     |
+        |           |  reg file + FSM |         |     |
+        |           |  + sha3_top     |         |     |
+        |           +-----------------+         |     |
+        |                                       v     |
+        |                       +---------------------+
+        |                       |  mux: ex_result =   |
+        |                       |  cop_read ?         |
+        |                       |  cop_result :       |
+        |                       |  ALU_Result         |
+        |                       +----------+----------+
+        |                                  |
+        |                                  v  rides the ALU path
+        |                           ex_alu -> mem_alu -> wb_alu -> regfile
+```
+
+The coprocessor lives in the EX stage. For `POLL`/`READ` its result is muxed onto the ALU result, so it flows to writeback exactly like an `ADD` result — which is why the existing forwarding unit handles dependencies with no extra logic.
+
+---
+
+## 6. The Four Pipeline Changes
+
+Option C is the most invasive option, but the changes are still small and localized:
+
+**(1) `Control_Unit_cop.v`**
+- Decodes opcode CUSTOM-0.
+- Takes `funct3` as a new input so it can set `regwrite = 1` only for `POLL`/`READ` sub-ops (which produce a result) and `0` for `FEED`/`CFG`/`START`.
+- Emits a new output, `is_cop`.
+
+**(2) `IdEx_cop.v`**
+- The control bus is widened from 14 to **18 bits** to carry `is_cop` (bit 17) and `cop_func = funct3` (bits 16:14) from ID into EX.
+
+**(3) `sha3_cop.v`**
+- The coprocessor module, instantiated in EX. `FEED`/`CFG`/`START` write its internal state; `POLL`/`READ` drive `cop_result` combinationally. A background FSM runs the SHA-3 core after `START`.
+
+**(4) `Main_Module_cop.v`**
+- Instantiates `sha3_cop` and adds one mux on the ALU result:
+  ```verilog
+  ex_cop_read = is_cop & (cop_func==POLL | cop_func==READ);
+  ex_result   = ex_cop_read ? cop_result : ALU_Result;
+  ```
+  `ex_alu` then carries `ex_result` instead of `ALU_Result`.
+
+> Nothing else changes: the hazard-detection unit, branch resolution, memory stage, and forwarding unit are all untouched.
+
+---
+
+## 7. Inside `sha3_cop` (The Coprocessor)
+
+**Inputs from the EX stage:**
+
+| Signal | Description |
+|--------|-------------|
+| `cop_en` | A CUSTOM-0 instruction is in EX this cycle (`= is_cop`) |
+| `cop_func` | The `funct3` sub-op |
+| `rs1_val` | Forwarded `rs1` value (`alu_in1`) |
+| `rs2_val` | Forwarded `rs2` value (`alu_in21`) |
+
+**Output:** `cop_result` — combinational result for `POLL`/`READ` (same cycle)
+
+**Internal state:** 17 lanes × 64 bits, `lane_count`, `last_bytecnt`, `feed_ptr`, `hash_latched` (256 bits), `done_sticky`, background FSM, and the `sha3_top` instance.
+
+**Behavior when `cop_en` is high:**
+
+| Sub-op | Action |
+|--------|--------|
+| `FEED` | `lane[feed_ptr] = { rs2_val, rs1_val }; feed_ptr++` |
+| `CFG` | `lane_count = rs1_val[4:0]; last_bytecnt = rs2_val[3:0]` |
+| `START` | Pulse the FSM start; reset `feed_ptr` for a future message |
+| `POLL`/`READ` | No state change (pure reads) |
+
+**Combinational reads:**
+
+| Sub-op | `cop_result` |
+|--------|-------------|
+| `POLL` | `{ 31'b0, done_sticky }` |
+| `READ` | Hash word selected by `rs2_val[2:0]` |
+
+**Background FSM** (identical idea to Options A/B):
+
+`IDLE → (start) → FEED → (last lane) → HASH → (hash_valid) → DONE → IDLE`
+
+FEED presents one lane per cycle to the core with `valid_in`; the last lane also drives `is_last` and `byte_count`. HASH waits out the 24 rounds. DONE latches `hash_out` and sets `done_sticky`.
+
+---
+
+## 8. How Results Reach the Register File (and Why Forwarding Just Works)
+
+`POLL` and `READ` must deliver a value to `rd`. Rather than add a new writeback source, the design muxes `cop_result` onto the **existing ALU result** in EX:
+
+```verilog
+ex_result = ex_cop_read ? cop_result : ALU_Result;
+ex_alu    = { ex_zero, ex_result };
+```
+
+From here the value travels the normal path: `ex_alu → mem_alu → wb_alu → register file`, gated by `regwrite` (which `Control_Unit` set to `1` for `POLL`/`READ`).
+
+Because the result is on the ordinary ALU path, the pipeline's **existing forwarding unit** automatically forwards it to later instructions. In particular, the poll loop:
+
+```asm
+SHA.POLL x16
+beq x16, x0, poll
+```
+
+works with no special handling: when the `BEQ` is in EX, the `POLL` is in MEM, so `forwardA` forwards `x16` from the MEM stage into the branch comparison — exactly the same forwarding that makes `add x16,..; beq x16,..` work.
+
+---
+
+## 9. Byte Ordering and the 64-bit-lane / 32-bit-CPU Split
+
+Same packing as Options A/B. The core's padder expects each word MSB-packed, big-endian. For `"abc"` (`'a'=0x61`, `'b'=0x62`, `'c'=0x63`):
+
+```
+64-bit lane the core wants = 0x6162630000000000
+
+low  32 bits = 0x00000000   (passed in rs1 to SHA.FEED)
+high 32 bits = 0x61626300   (passed in rs2 to SHA.FEED)
+
+SHA.CFG : lane_count = 1, byte_count = 3
+```
+
+Inside the coprocessor: `lane[feed_ptr] = { rs2_val, rs1_val }` (hi:lo).
+
+---
+
+## 10. The Completion Problem and Polling
+
+The hash takes ~45 cycles, so you cannot `SHA.READ` immediately after `SHA.START`. The program polls:
+
+```asm
+SHA.START
+poll:
+  SHA.POLL x16        ; x16 <- done bit
+  beq x16, x0, poll   ; loop until done
+  SHA.READ ...        ; now safe
+```
+
+Each `SHA.POLL` is a single-cycle EX operation that returns `0` until the background FSM finishes, then `1`. No pipeline stall is needed — the latency is hidden by the loop, just as in Options A/B, but here **via opcodes** rather than memory accesses. This is why Option C, despite touching the control path, needs no new stall logic.
+
+---
+
+## 11. End-to-End Data Flow
+
+1. CPU executes `SHA.CFG` — sets `lane_count`, `byte_count` in the coprocessor.
+2. CPU executes `SHA.FEED` (lane 0 = `{rs2, rs1}`); `feed_ptr` advances.
+3. CPU executes `SHA.START`. Coprocessor FSM: `IDLE → FEED`.
+4. FSM presents `lane[0]` to the core (`valid_in`, `is_last`, `byte_count`); the padder builds the 1088-bit block. FSM → `HASH`.
+5. `keccak_f` runs 24 rounds; FSM waits.
+6. Core pulses `hash_valid`; FSM latches the digest, sets `done_sticky`.
+7. Meanwhile the CPU loops `SHA.POLL`/`beq`; it now reads `done = 1`.
+8. CPU executes `SHA.READ` ×8 (indices 0..7); each returns one digest word via `cop_result` on the ALU path.
+9. (Demo) CPU stores the digest words to RAM for inspection.
+
+---
+
+## 12. File-by-File Description
+
+### Integration (new / modified)
+
+| File | Description |
+|------|-------------|
+| `sha3_cop.v` | The datapath coprocessor: register file + custom-op interface + background FEED/HASH/DONE FSM. Instantiates `sha3_top`. |
+| `Control_Unit_cop.v` | Control unit extended to decode CUSTOM-0. New `funct3` input, new `is_cop` output; `regwrite` set only for `POLL`/`READ`. |
+| `IdEx_cop.v` | ID/EX pipeline register widened to an 18-bit control bus (adds `is_cop` and `cop_func`). |
+| `Main_Module_cop.v` | Top module: instantiates `sha3_cop` and muxes `cop_result` onto the ALU result path. Flat (no `` `include ``) for Icarus; for Vivado add all files to the project. |
+
+### Verification
+
+| File | Description |
+|------|-------------|
+| `tb_cop.v` | End-to-end testbench: runs the full pipeline executing the demo program and checks the digest stored to RAM. |
+| `assemble_cop.py` | Hand-assembler that emits the demo program (custom instructions) as `i_mem` byte initializers. |
+| `Instr_Mem_cop.v` | Instruction memory preloaded with the assembled demo program. |
+| `Data_Mem_cop.v` | Data memory seeding constants and the READ index values 0..7 at reset. |
+
+### Unchanged Pipeline Modules
+
+`ALU.v`, `ALU_Control.v`, `Ex_Mem.v`, `Forwarding_Unit.v`, `Hazard_Detection_Unit.v`, `IfId.v`, `Imm_Gen.v`, `MemWb.v`, `PC.v`, `Reg_File.v`
+
+> **Note:** `Control_Unit` and `IdEx` are **replaced** by the `_cop` versions.
+
+### SHA-3 Core (unchanged)
+
+`TOp_module.v` (`sha3_top`), `input_register.v`, `padder_unit.v`, `state_formation.v`, `keccak_f.v`, `keccak_round.v`, `theta.v`, `rho.v`, `pi.v`, `chi.v`, `iota.v`
+
+---
+
+## 13. The Demo Program (Full Assembly Listing)
+
+**Seeded in RAM at reset (`Data_Mem_cop.v`):**
+
+| Address | Value | Meaning |
+|---------|-------|---------|
+| `MEM[0x00]` | `0x00000000` | Message low half |
+| `MEM[0x04]` | `0x61626300` | Message high half (`"abc"`) |
+| `MEM[0x08]` | `0x00000001` | `1` (lane count) |
+| `MEM[0x0C]` | `0x00000003` | `3` (byte count) |
+| `MEM[0x10..0x2C]` | `0, 1, 2, 3, 4, 5, 6, 7` | READ index constants |
+
+**Custom mnemonics:**
+
+```
+SHA.CFG  rs1, rs2    ; CUSTOM-0 funct3=001
+SHA.FEED rs1, rs2    ; CUSTOM-0 funct3=000
+SHA.START            ; CUSTOM-0 funct3=010
+SHA.POLL rd          ; CUSTOM-0 funct3=011
+SHA.READ rd, idxreg  ; CUSTOM-0 funct3=100  (idx from idxreg's low 3 bits)
+```
+
+**Program:**
+
+```asm
+; ---- load constants ----
+lw   x2, 0x00(x0)   ; msg lo
+lw   x3, 0x04(x0)   ; msg hi
+lw   x4, 0x08(x0)   ; 1  (lane count)
+lw   x6, 0x0C(x0)   ; 3  (byte count)
+lw   x8,  0x10(x0)  ; 0  \
+lw   x9,  0x14(x0)  ; 1   |
+lw   x10, 0x18(x0)  ; 2   |  index constants
+lw   x11, 0x1C(x0)  ; 3   |  for SHA.READ
+lw   x12, 0x20(x0)  ; 4   |
+lw   x13, 0x24(x0)  ; 5   |
+lw   x14, 0x28(x0)  ; 6   |
+lw   x15, 0x2C(x0)  ; 7  /
+
+; ---- configure + feed + start ----
+SHA.CFG   x4, x6    ; lane_count=1, byte_count=3
+SHA.FEED  x2, x3    ; lane 0 = { x3, x2 }
+SHA.START
+
+; ---- poll until done ----
+poll:
+SHA.POLL  x16       ; x16 <- done
+beq  x16, x0, poll  ; loop while 0
+
+; ---- read digest words 0..7 ----
+SHA.READ  x17, x8   ; word 0
+SHA.READ  x18, x9   ; word 1
+SHA.READ  x19, x10  ; word 2
+SHA.READ  x20, x11  ; word 3
+SHA.READ  x21, x12  ; word 4
+SHA.READ  x22, x13  ; word 5
+SHA.READ  x23, x14  ; word 6
+SHA.READ  x24, x15  ; word 7
+
+; ---- store digest to RAM 0x40..0x5F ----
+sw   x17, 0x40(x0)
+sw   x18, 0x44(x0)
+sw   x19, 0x48(x0)
+sw   x20, 0x4C(x0)
+sw   x21, 0x50(x0)
+sw   x22, 0x54(x0)
+sw   x23, 0x58(x0)
+sw   x24, 0x5C(x0)
+
+; ---- halt ----
+beq  x0, x0, 0      ; spin forever
+```
+
+> For SHA3-256 only words 0..3 (256 bits) are meaningful; the demo reads all 8 to exercise the READ index path. To change the program, edit `assemble_cop.py` and re-run it to regenerate the `i_mem` initializer block, then rebuild `Instr_Mem_cop.v`.
+
+---
+
+## 14. How to Build and Run
+
+Requires Icarus Verilog. On Ubuntu:
+```bash
+sudo apt install iverilog
+```
+
+```bash
+iverilog -g2012 -o tb_cop.out \
+  tb_cop.v Main_Module_cop.v Instr_Mem_cop.v Data_Mem_cop.v \
+  Control_Unit_cop.v IdEx_cop.v sha3_cop.v \
+  ALU.v ALU_Control.v Ex_Mem.v Forwarding_Unit.v \
+  Hazard_Detection_Unit.v IfId.v Imm_Gen.v MemWb.v PC.v Reg_File.v \
+  TOp_module.v input_register.v padder_unit.v state_formation.v \
+  keccak_f.v keccak_round.v theta.v rho.v pi.v chi.v iota.v
+
 vvp tb_cop.out
 ```
 
-Prints `PASS`.
+> **Important:** Use `Control_Unit_cop.v` and `IdEx_cop.v`, **not** the originals. Do not also include the unmodified `Control_Unit.v` / `IdEx.v` in the same compile, or you will get "module already defined" errors / wrong control widths.
 
-## The demo program
+---
+
+## 15. Expected Output
 
 ```
-  lw   x2, 0x00(x0)    ; msg lo  = 0x00000000   (seeded)
-  lw   x3, 0x04(x0)    ; msg hi  = 0x61626300
-  lw   x4, 0x08(x0)    ; 1       (lane count)
-  lw   x6, 0x0C(x0)    ; 3       (byte count)
-  lw   x8..x15, ...    ; index constants 0..7   (for READ)
-  SHA.CFG   x4, x6     ; lane_count=1, bytecnt=3
-  SHA.FEED  x2, x3     ; lane0 = {x3,x2}
-  SHA.START
-poll:
-  SHA.POLL  x16        ; x16 <- done
-  beq  x16, x0, poll   ; spin until done
-  SHA.READ  x17, x8    ; digest word 0  (index in x8=0)
-  ... x18..x24 (indices x9..x15 = 1..7)
-  sw   x17..x24, 0x40  ; store digest to RAM for inspection
-  beq  x0,x0,0         ; halt
+=== Option C: custom-instruction SHA3-256("abc") ===
+Digest in RAM: 3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532
+Expected:      3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532
+PASS
 ```
 
-## How Option C compares
+---
 
-| | A (mem-mapped) | B (AXI4-Lite) | C (custom instr) |
-|--|--|--|--|
-| CPU interface | `lw`/`sw` to an address | `lw`/`sw` -> AXI master -> bus | new opcodes |
-| Decoder change | address decode in MEM | address decode + AXI master | new opcode in Control_Unit |
-| Pipeline surgery | minimal | stall path needed | control bus widened, result mux |
-| Portability | needs a memory bus | drops on any AXI fabric | tied to this core's ISA |
-| Speed | bus-limited | bus-limited | tightest (no address overhead) |
+## 16. Porting to Real Hardware and the Toolchain
 
-C is the fastest and most tightly coupled, but the least portable: the
-accelerator is now part of the CPU's instruction set, so it cannot be reused on
-a different processor without re-implementing the decode. The paper lists this
-ISA-extension route as future work for exactly this reason.
+- **Resources:** The iterative SHA-3 core is ~6,100 FFs — fits XC7Z020 / Arty A7, exceeds the iCE40UP5K. On the small board, Option C is a simulation exercise.
 
-## Notes / limitations
+- **Toolchain:** A production custom-instruction design also extends the assembler so you can write `sha.feed x2,x3` in C/asm instead of hand-encoding CUSTOM-0 words. Two common routes:
+  - **GNU `as` `.insn` directive** — emit raw encodings inline without modifying the assembler at all:
+    ```asm
+    .insn r 0x0B, 0x0, 0x0, x0, x2, x3   ; FEED
+    ```
+  - **A full toolchain patch** (binutils/LLVM) adding real mnemonics — heavier, but what the paper's future-work ISA-extension implies.
 
-- Single-block messages only (sha3_top hardwires use_feedback=0).
-- The CPU has no ADDI, so constants/indices are seeded in RAM and loaded with
-  lw, same as the Option A demo. Adding ADDI would make the program fully
-  self-contained.
-- Simulation integration; the ~6.1k-FF core fits XC7Z020 / Arty A7, not the
-  iCE40UP5K.
-- A production custom-instruction design would also extend the assembler/
-  toolchain so you could write `sha.feed` in C/asm directly instead of
-  hand-encoding CUSTOM-0 words.
-```
+- **Reusability caveat:** Because the accelerator is now part of the decode, it cannot be moved to a different CPU without porting changes (1), (2), (4). If you anticipate reusing the core across processors, Option A or B is the better structural choice; Option C trades that reuse for tightest coupling and lowest per-call overhead.
+
+- **Clocking:** The coprocessor is synchronous to the pipeline clock; no clock-domain crossing.
+
+---
+
+## 17. Known Limitations
+
+- **Single block only.** `sha3_top` hardwires `state_formation` `use_feedback=0`, so only messages fitting one 1088-bit block (≤ 17 lanes) are supported. Wiring the feedback path lifts this for all three options.
+
+- **No ADDI in the CPU.** Constants and READ indices are seeded in RAM and loaded with `lw`. Adding ADDI would make the program self-contained.
+
+- **READ index comes from a register** (no R-type immediate in this pipeline), so the demo pre-loads 0..7 into registers. With an immediate form the index could be encoded directly in the instruction.
+
+- **Polling, not interrupts.** Completion is found via `SHA.POLL`. An IRQ on `hash_valid` would let the CPU do other work meanwhile.
+
+- **One coprocessor instance / one in-flight hash.** A second `SHA.START` before the first completes would restart the FSM.
+
+---
+
+## 18. Troubleshooting
+
+**"module already defined" at compile**
+- You included both `Control_Unit.v` and `Control_Unit_cop.v` (or both `IdEx` versions). Use only the `_cop` versions for Option C.
+
+**`regwrite`/decoding wrong; `POLL`/`READ` don't update a register**
+- Confirm `Control_Unit_cop.v` receives `funct3` and that `Main_Module_cop.v` passes `id_funct3` to it. `regwrite` must be `1` for `funct3=011`/`100`.
+
+**Control bits not reaching EX (`is_cop` always 0 in EX)**
+- The control bus must be 18 bits end to end. Confirm `IdEx_cop.v` is used and that `id_control_sig` is packed as `{is_cop, funct3, core[13:0]}`.
+
+**Digest wrong but non-zero**
+- Byte packing ([Section 9](#9-byte-ordering-and-the-64-bit-lane--32-bit-cpu-split)): `FEED rs1 = low half (0x00000000)`, `rs2 = high half (0x61626300)`; `SHA.CFG byte_count = 3` for `"abc"`.
+- `lane_count` in `SHA.CFG` must match the number of `SHA.FEED` instructions.
+
+**Poll loop never exits**
+- `done_sticky` never set → the FSM never reached DONE. Check that `SHA.START` actually executed (`funct3=010`) and that `lane_count >= 1`.
+
+**`SHA.READ` returns the wrong word**
+- The index comes from `rs2`'s low 3 bits. Make sure the index register holds the intended value (the demo seeds 0..7 in `x8..x15`).
+
+**Works for `POLL` but `BEQ` in the loop behaves oddly**
+- The `POLL` result rides the ALU path and is forwarded from MEM to the `BEQ` in EX. If you reordered the loop so `POLL` and `BEQ` are not adjacent, ensure the dependency is still satisfiable by forwarding, or add a `nop`.
